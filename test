@@ -1,0 +1,1205 @@
+--[[
+	rocheese.luau - RoChess! engine panel + autopilot
+	Luau, Real executor, client side.
+
+	Uses the game's own modules instead of re-implementing chess:
+		ReplicatedStorage.Chess.Engine       board, legal moves, UCI/SAN, FEN
+		ReplicatedStorage.Chess.Bot          local search: analyse(fen,moves,sec,depth) / think(fen,moves,persona)
+		ReplicatedStorage.Chess.VortexBot    server engine bridge: analyse / think
+		ReplicatedStorage.ChessClient.App    live client state: session, board, onBoardMove, playMove
+
+	Squares use Engine.algToIndex64 (bottom-up, a1 = 1, h8 = 64).
+	Engine scores are always from WHITE's side of the board.
+
+	Panel: top-right (adaptive for PC/Mobile), drag it by the title.
+	Arrows on the board:
+		green  = best move      blue = second best      yellow = third best
+]]
+
+local Players = game:GetService("Players")
+local UserInputService = game:GetService("UserInputService")
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
+local TweenService = game:GetService("TweenService")
+
+local LocalPlayer = Players.LocalPlayer
+local Chess = ReplicatedStorage:WaitForChild("Chess")
+local Client = ReplicatedStorage:WaitForChild("ChessClient")
+
+local function req(mod)
+	return require(mod)
+end
+
+local Engine = req(Chess:WaitForChild("Engine"))
+local Bot = req(Chess:WaitForChild("Bot"))
+local VortexBot = req(Chess:WaitForChild("VortexBot"))
+local App = req(Client:WaitForChild("App"))
+
+local GENV = getgenv()
+GENV.__RoCheeseGen = (GENV.__RoCheeseGen or 0) + 1
+local GEN = GENV.__RoCheeseGen
+
+local CFG = {
+	W = 344,
+	H = 490, -- Увеличено для новых настроек кастомизации
+	MARGIN = 14,
+	TOP = 84,
+	DEPTH = 16,
+	SECONDS = 0.8,
+	CHILD_DEPTH = 8,
+	CHILD_SECONDS = 0.06,
+	VK_SHIFT = 160,
+	PROMO = { q = 5, r = 4, b = 3, n = 2 },
+	DELAY_MIN = 0,
+	DELAY_MAX = 20,
+	DELAY_STEP = 0.5,
+}
+
+local THEMES = {
+	dark = {
+		name = "Dark Classic",
+		bg = Color3.fromRGB(17, 18, 22),
+		idle = Color3.fromRGB(36, 39, 46),
+		on = Color3.fromRGB(52, 104, 60),
+		raj = Color3.fromRGB(148, 54, 48),
+		txt = Color3.fromRGB(236, 238, 241),
+		dim = Color3.fromRGB(160, 166, 176),
+		acc = Color3.fromRGB(255, 170, 0),
+	},
+	cyber = {
+		name = "Cyberpunk",
+		bg = Color3.fromRGB(13, 2, 33),
+		idle = Color3.fromRGB(39, 15, 68),
+		on = Color3.fromRGB(0, 200, 150),
+		raj = Color3.fromRGB(255, 45, 85),
+		txt = Color3.fromRGB(220, 240, 255),
+		dim = Color3.fromRGB(130, 140, 180),
+		acc = Color3.fromRGB(0, 243, 255),
+	},
+	minimal = {
+		name = "Minimal Light",
+		bg = Color3.fromRGB(245, 247, 250),
+		idle = Color3.fromRGB(220, 225, 235),
+		on = Color3.fromRGB(46, 160, 67),
+		raj = Color3.fromRGB(218, 54, 51),
+		txt = Color3.fromRGB(30, 35, 45),
+		dim = Color3.fromRGB(100, 110, 125),
+		acc = Color3.fromRGB(9, 105, 218),
+	},
+	amethyst = {
+		name = "Amethyst",
+		bg = Color3.fromRGB(25, 20, 35),
+		idle = Color3.fromRGB(50, 40, 70),
+		on = Color3.fromRGB(90, 180, 100),
+		raj = Color3.fromRGB(190, 60, 90),
+		txt = Color3.fromRGB(240, 235, 250),
+		dim = Color3.fromRGB(170, 160, 190),
+		acc = Color3.fromRGB(180, 100, 255),
+	}
+}
+
+local PRESETS = {
+	legit = {
+		label = "LEGIT",
+		source = "local",
+		mode = "elo",
+		elo = 1500,
+		noise = 0.32,
+		blunder = 0.06,
+		delayMin = 5,
+		delayMax = 10,
+	},
+	raj = {
+		label = "RAJ",
+		source = "vortex",
+		mode = "best",
+		elo = 1800,
+		noise = 0,
+		blunder = 0,
+		delayMin = 0.5,
+		delayMax = 1.5,
+	},
+}
+
+local RUNTIME = GENV.__RoCheese or {}
+RUNTIME.SHOW_ARROW = RUNTIME.SHOW_ARROW ~= false
+RUNTIME.AUTO = RUNTIME.AUTO == true
+RUNTIME.HUMANIZE = RUNTIME.HUMANIZE ~= false
+RUNTIME.SOURCE = RUNTIME.SOURCE == "vortex" and "vortex" or "local"
+RUNTIME.MODE = RUNTIME.MODE == "best" and "best" or "elo"
+RUNTIME.ELO = tonumber(RUNTIME.ELO) or 1500
+RUNTIME.NOISE = tonumber(RUNTIME.NOISE) or 0.32
+RUNTIME.BLUNDER = tonumber(RUNTIME.BLUNDER) or 0.06
+RUNTIME.DELAY_MIN = math.clamp(tonumber(RUNTIME.DELAY_MIN) or 5, CFG.DELAY_MIN, CFG.DELAY_MAX)
+RUNTIME.DELAY_MAX = math.clamp(tonumber(RUNTIME.DELAY_MAX) or 10, CFG.DELAY_MIN, CFG.DELAY_MAX)
+RUNTIME.STYLE = RUNTIME.STYLE == "raj" and "raj" or (RUNTIME.STYLE == "legit" and "legit" or "custom")
+RUNTIME.THEME = RUNTIME.THEME or "dark"
+RUNTIME.TRANSPARENCY = tonumber(RUNTIME.TRANSPARENCY) or 0.04
+RUNTIME.ARROW_1 = RUNTIME.ARROW_1 or Color3.fromRGB(129, 182, 76)
+RUNTIME.ARROW_2 = RUNTIME.ARROW_2 or Color3.fromRGB(96, 156, 240)
+RUNTIME.ARROW_3 = RUNTIME.ARROW_3 or Color3.fromRGB(240, 200, 70)
+GENV.__RoCheese = RUNTIME
+
+local CURRENT_THEME = THEMES[RUNTIME.THEME] or THEMES.dark
+local ARROW_KEYS = { "rc1", "rc2", "rc3" }
+
+local S = {
+	ply = -1,
+	sessionId = nil,
+	best = nil,
+	san = nil,
+	score = 0,
+	depth = 0,
+	second = nil,
+	third = nil,
+	secondSan = nil,
+	thirdSan = nil,
+	busy = false,
+	autoAt = 0,
+	thinkAt = 0,
+	status = "loading",
+}
+GENV.__RoCheeseState = S
+
+local LIVE = _G.STATE
+
+local function alive()
+	if GENV.__RoCheeseGen ~= GEN then
+		return false
+	end
+	if typeof(LIVE) == "table" and type(LIVE.alive) == "function" then
+		return LIVE.alive()
+	end
+	return true
+end
+
+local function cleanup(fn)
+	if typeof(LIVE) == "table" and type(LIVE.onCleanup) == "function" then
+		LIVE.onCleanup(fn)
+	end
+end
+
+-- board ------------------------------------------------------------------------------------
+
+local function clearArrows()
+	local board = App.board
+	if not board or type(board.setArrow) ~= "function" then
+		return
+	end
+	for _, key in ARROW_KEYS do
+		pcall(function()
+			board:setArrow(key, nil)
+			board:setTint(key, nil)
+		end)
+	end
+	pcall(function()
+		board:setArrow("rocheese", nil)
+		board:setTint("rocheese", nil)
+	end)
+end
+
+local function drawArrow(key, uci, color, tint)
+	local board = App.board
+	if not board then
+		return
+	end
+	local from = Engine.algToIndex64(uci:sub(1, 2))
+	local to = Engine.algToIndex64(uci:sub(3, 4))
+	if not from or not to then
+		return
+	end
+	pcall(function()
+		board:setArrow(key, from, to, color, 0.12)
+		if tint then
+			board:setTint(key, to, color, 0.26)
+		end
+	end)
+end
+
+-- engine ----------------------------------------------------------------------------------
+
+local function buildEngine(startFen, moves)
+	local engine = Engine.new(startFen)
+	for _, uci in ipairs(moves) do
+		local mv = engine:moveFromUci(uci)
+		if not mv then
+			return nil
+		end
+		engine:play(mv)
+	end
+	return engine
+end
+
+local function sanOf(engine, uci)
+	if not engine or not uci then
+		return nil
+	end
+	local want = string.lower(uci)
+	for _, mv in engine:legalMoves() do
+		local u = engine:moveToUci(mv)
+		if u and string.lower(u) == want then
+			return engine:moveToSan(mv)
+		end
+	end
+	return nil
+end
+
+local function analyseBest(startFen, moves)
+	if RUNTIME.SOURCE == "vortex" then
+		local ok, res = pcall(VortexBot.analyse, startFen, moves, CFG.SECONDS, CFG.DEPTH)
+		if ok and type(res) == "table" and res.best then
+			return res
+		end
+	end
+	local ok, res = pcall(Bot.analyse, startFen, moves, CFG.SECONDS, CFG.DEPTH)
+	if ok and type(res) == "table" then
+		return res
+	end
+	return nil
+end
+
+local function rankContinuations(startFen, moves, skipUci)
+	local engine = buildEngine(startFen, moves)
+	if not engine then
+		return nil
+	end
+	local scored = {}
+	for _, mv in engine:legalMoves() do
+		local uci = engine:moveToUci(mv)
+		if not skipUci or string.lower(uci) ~= string.lower(skipUci) then
+			local child = Engine.new(startFen)
+			local ok = pcall(function()
+				child:playUci(uci)
+			end)
+			if ok then
+				local cres = Bot.analyse(child:getFen(), {}, CFG.CHILD_SECONDS, CFG.CHILD_DEPTH)
+				table.insert(scored, {
+					uci = uci,
+					san = engine:moveToSan(mv),
+					score = tonumber(cres and cres.score) or 0,
+				})
+			end
+		end
+	end
+	table.sort(scored, function(a, b)
+		return a.score > b.score
+	end)
+	return scored
+end
+
+local function pickMove(session)
+	if RUNTIME.MODE == "elo" then
+		local ok, uci = pcall(Bot.think, session.startFen, table.clone(session.ucis), {
+			rating = RUNTIME.ELO,
+			noise = RUNTIME.NOISE,
+			blunder = RUNTIME.BLUNDER,
+			time = 0.6,
+			depth = 14,
+		})
+		if ok and type(uci) == "string" then
+			return uci
+		end
+	end
+	return S.best
+end
+
+-- playing ---------------------------------------------------------------------------------
+
+local function tapInput()
+	if not RUNTIME.HUMANIZE then
+		return
+	end
+	if type(keyclick) ~= "function" then
+		return
+	end
+	if type(isrbxactive) == "function" and not isrbxactive() then
+		return
+	end
+	pcall(keyclick, CFG.VK_SHIFT)
+end
+
+local function playUci(uci)
+	local session = App.session
+	if not session or session.over then
+		return false, "no game"
+	end
+	if not session:isMyTurn() then
+		return false, "not your turn"
+	end
+	local from = Engine.algToIndex64(uci:sub(1, 2))
+	local to = Engine.algToIndex64(uci:sub(3, 4))
+	if not from or not to then
+		return false, "bad uci"
+	end
+	local promo = CFG.PROMO[uci:sub(5, 5)] or 0
+	local before = #session.ucis
+	tapInput()
+	local ok = false
+	pcall(function()
+		ok = App.onBoardMove(from, to, promo, nil)
+	end)
+	if not ok or #session.ucis == before then
+		pcall(function()
+			App.playMove(uci)
+		end)
+	end
+	return true, uci
+end
+
+local function humanDelay()
+	local lo = math.min(RUNTIME.DELAY_MIN, RUNTIME.DELAY_MAX)
+	local hi = math.max(RUNTIME.DELAY_MIN, RUNTIME.DELAY_MAX)
+	if hi - lo < 0.2 then
+		return lo
+	end
+	return lo + math.random() * (hi - lo)
+end
+
+local function autopilotTick(session, ply)
+	if not RUNTIME.AUTO then
+		return
+	end
+	if session.over or not session:isMyTurn() then
+		return
+	end
+	if session.viewPly ~= ply or S.busy or not S.best then
+		return
+	end
+	local now = os.clock()
+	if now < S.thinkAt then
+		return
+	end
+	local uci = pickMove(session)
+	if type(uci) ~= "string" then
+		return
+	end
+	task.spawn(function()
+		if not alive() then
+			return
+		end
+		if App.session == session and not session.over and session:isMyTurn() then
+			playUci(uci)
+		end
+	end)
+end
+
+-- gui -------------------------------------------------------------------------------------
+
+local gui = nil
+local panel = nil
+local rows = {}
+local btns = {}
+local dot = nil
+local dragged = false
+local lastEval = nil
+
+local toggleAuto, playNow, copyPosition, refreshButtons, syncDelay, applyPreset, startBotGame, cycleTheme, cycleTransparency
+
+local function mkText(parent, y, h, size, color, bold, x)
+	local t = Instance.new("TextLabel")
+	t.BackgroundTransparency = 1
+	t.Size = UDim2.fromOffset(CFG.W - 28 - (x or 14), h)
+	t.Position = UDim2.fromOffset(x or 14, y)
+	t.Font = bold and Enum.Font.GothamBold or Enum.Font.Gotham
+	t.TextSize = size
+	t.TextColor3 = color
+	t.TextXAlignment = Enum.TextXAlignment.Left
+	t.TextYAlignment = Enum.TextYAlignment.Center
+	t.TextTruncate = Enum.TextTruncate.AtEnd
+	t.Parent = parent
+	return t
+end
+
+local function mkButton(y, h, text, width, onClick)
+	local b = Instance.new("TextButton")
+	b.BackgroundColor3 = CURRENT_THEME.idle
+	b.BorderSizePixel = 0
+	b.AutoButtonColor = false
+	b.Size = UDim2.fromOffset(width or (CFG.W - 28), h)
+	b.Position = UDim2.fromOffset(14, y)
+	b.Font = Enum.Font.GothamBold
+	b.TextSize = 12
+	b.TextColor3 = CURRENT_THEME.txt
+	b.Text = text
+	b.Parent = panel
+	local c = Instance.new("UICorner")
+	c.CornerRadius = UDim.new(0, 6)
+	c.Parent = b
+	local s = Instance.new("UIStroke")
+	s.Color = Color3.fromRGB(255, 255, 255)
+	s.Thickness = 1
+	s.Transparency = 0.85
+	s.Parent = b
+	b.MouseButton1Click:Connect(onClick)
+	b.MouseEnter:Connect(function()
+		s.Transparency = 0.45
+	end)
+	b.MouseLeave:Connect(function()
+		s.Transparency = 0.85
+	end)
+	return b
+end
+
+local function setBtn(b, on, text, onColor)
+	b.BackgroundColor3 = on and (onColor or CURRENT_THEME.on) or CURRENT_THEME.idle
+	b.TextColor3 = CURRENT_THEME.txt
+	b.Text = text
+end
+
+local function mkSeparator(y)
+	local sep = Instance.new("Frame")
+	sep.BackgroundColor3 = CURRENT_THEME.txt
+	sep.BackgroundTransparency = 0.87
+	sep.BorderSizePixel = 0
+	sep.Size = UDim2.fromOffset(CFG.W - 28, 1)
+	sep.Position = UDim2.fromOffset(14, y)
+	sep.Parent = panel
+	return sep
+end
+
+local function mkDot(x, y, color, size)
+	local d = Instance.new("Frame")
+	d.BackgroundColor3 = color
+	d.BorderSizePixel = 0
+	d.Size = UDim2.fromOffset(size or 9, size or 9)
+	d.Position = UDim2.fromOffset(x, y)
+	d.Parent = panel
+	local c = Instance.new("UICorner")
+	c.CornerRadius = UDim.new(1, 0)
+	c.Parent = d
+	return d
+end
+
+local function mkDelayRow(y)
+	local row = Instance.new("Frame")
+	row.BackgroundTransparency = 1
+	row.Size = UDim2.fromOffset(CFG.W - 28, 26)
+	row.Position = UDim2.fromOffset(14, y)
+	row.Parent = panel
+
+	local title = Instance.new("TextLabel")
+	title.BackgroundTransparency = 1
+	title.Size = UDim2.fromOffset(42, 26)
+	title.Text = "DELAY"
+	title.Font = Enum.Font.GothamBold
+	title.TextSize = 11
+	title.TextColor3 = CURRENT_THEME.dim
+	title.TextXAlignment = Enum.TextXAlignment.Left
+	title.Parent = row
+
+	local values = {}
+
+	local function stepper(x, name, getVal, setVal)
+		local lab = Instance.new("TextLabel")
+		lab.BackgroundTransparency = 1
+		lab.Size = UDim2.fromOffset(28, 26)
+		lab.Position = UDim2.fromOffset(x, 0)
+		lab.Text = name
+		lab.Font = Enum.Font.GothamBold
+		lab.TextSize = 11
+		lab.TextColor3 = CURRENT_THEME.dim
+		lab.TextXAlignment = Enum.TextXAlignment.Left
+		lab.Parent = row
+
+		local function smallButton(px, sign)
+			local b = Instance.new("TextButton")
+			b.BackgroundColor3 = CURRENT_THEME.idle
+			b.BorderSizePixel = 0
+			b.AutoButtonColor = false
+			b.Size = UDim2.fromOffset(22, 22)
+			b.Position = UDim2.fromOffset(px, 2)
+			b.Font = Enum.Font.GothamBold
+			b.TextSize = 13
+			b.TextColor3 = CURRENT_THEME.txt
+			b.Text = sign
+			b.Parent = row
+			local c = Instance.new("UICorner")
+			c.CornerRadius = UDim.new(0, 5)
+			c.Parent = b
+			local s = Instance.new("UIStroke")
+			s.Color = Color3.fromRGB(255, 255, 255)
+			s.Thickness = 1
+			s.Transparency = 0.85
+			s.Parent = b
+
+			local holding = false
+			local function step()
+				setVal(getVal() + (sign == "+" and CFG.DELAY_STEP or -CFG.DELAY_STEP))
+			end
+			b.MouseButton1Down:Connect(function()
+				holding = true
+				step()
+				task.spawn(function()
+					task.wait(0.35)
+					local reps = 0
+					while holding and reps < 60 do
+						step()
+						reps += 1
+						task.wait(0.05)
+					end
+				end)
+			end)
+			b.MouseButton1Up:Connect(function()
+				holding = false
+			end)
+			b.MouseLeave:Connect(function()
+				holding = false
+			end)
+			return b
+		end
+
+		local value = Instance.new("TextLabel")
+		value.BackgroundTransparency = 1
+		value.Size = UDim2.fromOffset(38, 26)
+		value.Position = UDim2.fromOffset(x + 52, 0)
+		value.Font = Enum.Font.GothamBold
+		value.TextSize = 12
+		value.TextColor3 = CURRENT_THEME.txt
+		value.TextXAlignment = Enum.TextXAlignment.Center
+		value.Parent = row
+		values[name] = value
+
+		smallButton(x + 30, "-")
+		smallButton(x + 92, "+")
+	end
+
+	stepper(58, "MIN", function()
+		return RUNTIME.DELAY_MIN
+	end, function(v)
+		RUNTIME.DELAY_MIN = math.clamp(v, CFG.DELAY_MIN, CFG.DELAY_MAX - CFG.DELAY_STEP)
+		RUNTIME.STYLE = "custom"
+		syncDelay()
+		refreshButtons()
+	end)
+
+	stepper(176, "MAX", function()
+		return RUNTIME.DELAY_MAX
+	end, function(v)
+		RUNTIME.DELAY_MAX = math.clamp(v, RUNTIME.DELAY_MIN + CFG.DELAY_STEP, CFG.DELAY_MAX)
+		RUNTIME.STYLE = "custom"
+		syncDelay()
+		refreshButtons()
+	end)
+
+	local function layout()
+		values.MIN.Text = string.format("%.1fs", RUNTIME.DELAY_MIN)
+		values.MAX.Text = string.format("%.1fs", RUNTIME.DELAY_MAX)
+	end
+
+	layout()
+	return layout
+end
+
+local function buildGui()
+	local playerGui = LocalPlayer:WaitForChild("PlayerGui")
+	local old = playerGui:FindFirstChild("RoCheesePanel")
+	if old then
+		old:Destroy()
+	end
+	gui = Instance.new("ScreenGui")
+	gui.Name = "RoCheesePanel"
+	gui.ResetOnSpawn = false
+	gui.IgnoreGuiInset = true
+	gui.DisplayOrder = 999
+	gui.ZIndexBehavior = Enum.ZIndexBehavior.Sibling
+	gui.Parent = playerGui
+
+	panel = Instance.new("Frame")
+	panel.Name = "Panel"
+	panel.BackgroundColor3 = CURRENT_THEME.bg
+	panel.BackgroundTransparency = RUNTIME.TRANSPARENCY
+	panel.BorderSizePixel = 0
+	panel.Size = UDim2.fromOffset(CFG.W, CFG.H)
+	
+	-- Адаптивное позиционирование под мобилки и ПК
+	local cam = workspace.CurrentCamera
+	local vp = cam and cam.ViewportSize or Vector2.new(1920, 1080)
+	if vp.X < 800 then
+		-- Мобильный вариант (центрирование сверху)
+		panel.Position = UDim2.new(0.5, -CFG.W / 2, 0, CFG.TOP)
+	else
+		-- ПК вариант (справа сверху)
+		panel.Position = UDim2.fromOffset(vp.X - CFG.W - CFG.MARGIN, CFG.TOP)
+	end
+	
+	panel.Active = true
+	panel.Parent = gui
+
+	local corner = Instance.new("UICorner")
+	corner.CornerRadius = UDim.new(0, 12)
+	corner.Parent = panel
+
+	local stroke = Instance.new("UIStroke")
+	stroke.Color = CURRENT_THEME.acc
+	stroke.Thickness = 1
+	stroke.Transparency = 0.45
+	stroke.Parent = panel
+
+	rows.title = mkText(panel, 10, 22, 15, CURRENT_THEME.acc, true)
+	rows.title.Size = UDim2.fromOffset(CFG.W - 56, 22)
+
+	dot = mkDot(CFG.W - 32, 17, CURRENT_THEME.dim)
+
+	rows.status = mkText(panel, 34, 16, 11, CURRENT_THEME.dim)
+	rows.eval = mkText(panel, 54, 20, 14, CURRENT_THEME.txt, true)
+	rows.best = mkText(panel, 76, 18, 13, CURRENT_THEME.txt)
+	rows.rest = mkText(panel, 94, 18, 12, CURRENT_THEME.dim)
+	rows.game = mkText(panel, 114, 18, 11, CURRENT_THEME.dim)
+
+	mkSeparator(136)
+
+	local half = math.floor((CFG.W - 32) / 2)
+
+	btns.legit = mkButton(146, 30, "STYLE  LEGIT", half, function()
+		applyPreset("legit")
+	end)
+	btns.raj = mkButton(146, 30, "STYLE  RAJ", half, function()
+		applyPreset("raj")
+	end)
+	btns.raj.Position = UDim2.fromOffset(18 + half, 146)
+
+	syncDelay = mkDelayRow(182)
+
+	btns.best = mkButton(214, 26, "PLAY  BEST", half, function()
+		RUNTIME.MODE = RUNTIME.MODE == "best" and "elo" or "best"
+		RUNTIME.STYLE = "custom"
+		refreshButtons()
+	end)
+	btns.elo = mkButton(214, 26, "PLAY  ELO", half, function()
+		RUNTIME.MODE = RUNTIME.MODE == "elo" and "best" or "elo"
+		RUNTIME.STYLE = "custom"
+		refreshButtons()
+	end)
+	btns.elo.Position = UDim2.fromOffset(18 + half, 214)
+
+	btns.engineLocal = mkButton(246, 26, "ENGINE  LOCAL", half, function()
+		RUNTIME.SOURCE = RUNTIME.SOURCE == "local" and "vortex" or "local"
+		RUNTIME.STYLE = "custom"
+		S.ply = -1
+		refreshButtons()
+	end)
+	btns.engineVortex = mkButton(246, 26, "ENGINE  VORTEX", half, function()
+		RUNTIME.SOURCE = RUNTIME.SOURCE == "vortex" and "local" or "vortex"
+		RUNTIME.STYLE = "custom"
+		S.ply = -1
+		refreshButtons()
+	end)
+	btns.engineVortex.Position = UDim2.fromOffset(18 + half, 246)
+
+	btns.auto = mkButton(280, 34, "AUTOPLAY   OFF", nil, function()
+		toggleAuto()
+	end)
+
+	btns.play = mkButton(320, 26, "PLAY NOW", half, function()
+		playNow()
+	end)
+	btns.copy = mkButton(320, 26, "COPY FEN", half, function()
+		copyPosition()
+	end)
+	btns.copy.Position = UDim2.fromOffset(18 + half, 320)
+
+	btns.botgame = mkButton(352, 26, "BOT GAME  (practice)", nil, function()
+		startBotGame()
+	end)
+
+	mkSeparator(384)
+
+	-- Дополнительные кнопки кастомизации (Тема и прозрачность)
+	btns.theme = mkButton(394, 26, "THEME: " .. string.upper(RUNTIME.THEME), half, function()
+		cycleTheme()
+	end)
+	
+	btns.trans = mkButton(394, 26, "BG ALPHA", half, function()
+		cycleTransparency()
+	end)
+	btns.trans.Position = UDim2.fromOffset(18 + half, 394)
+
+	mkSeparator(426)
+
+	-- Легенда стрелок
+	mkDot(14, 440, RUNTIME.ARROW_1, 9)
+	local l1 = Instance.new("TextLabel")
+	l1.BackgroundTransparency = 1
+	l1.Size = UDim2.fromOffset(80, 20)
+	l1.Position = UDim2.fromOffset(27, 434)
+	l1.Font = Enum.Font.Gotham
+	l1.TextSize = 11
+	l1.TextColor3 = CURRENT_THEME.txt
+	l1.Text = "1 best"
+	l1.Parent = panel
+
+	mkDot(112, 440, RUNTIME.ARROW_2, 9)
+	local l2 = Instance.new("TextLabel")
+	l2.BackgroundTransparency = 1
+	l2.Size = UDim2.fromOffset(90, 20)
+	l2.Position = UDim2.fromOffset(125, 434)
+	l2.Font = Enum.Font.Gotham
+	l2.TextSize = 11
+	l2.TextColor3 = CURRENT_THEME.txt
+	l2.Text = "2 second"
+	l2.Parent = panel
+
+	mkDot(212, 440, RUNTIME.ARROW_3, 9)
+	local l3 = Instance.new("TextLabel")
+	l3.BackgroundTransparency = 1
+	l3.Size = UDim2.fromOffset(90, 20)
+	l3.Position = UDim2.fromOffset(225, 434)
+	l3.Font = Enum.Font.Gotham
+	l3.TextSize = 11
+	l3.TextColor3 = CURRENT_THEME.txt
+	l3.Text = "3 third"
+	l3.Parent = panel
+
+	rows.hint = mkText(panel, 462, 16, 10, Color3.fromRGB(112, 118, 128))
+	rows.hint.Text = "drag title | End auto | Home arrow | PgUp hide"
+
+	-- Перетаскивание панели мышкой или пальцем (ПК и Мобильные)
+	local dragging = false
+	local dragFrom = Vector2.zero
+	local dragStart = UDim2.fromOffset(0, 0)
+	rows.title.Active = true
+	
+	rows.title.InputBegan:Connect(function(input)
+		if input.UserInputType == Enum.UserInputType.MouseButton1 or input.UserInputType == Enum.UserInputType.Touch then
+			dragging = true
+			dragged = true
+			dragFrom = Vector2.new(input.Position.X, input.Position.Y)
+			dragStart = panel.Position
+		end
+	end)
+	
+	UserInputService.InputChanged:Connect(function(input)
+		if not dragging then
+			return
+		end
+		if input.UserInputType == Enum.UserInputType.MouseMovement or input.UserInputType == Enum.UserInputType.Touch then
+			local cam = workspace.CurrentCamera
+			local vp = cam and cam.ViewportSize or Vector2.new(1920, 1080)
+			local delta = Vector2.new(input.Position.X - dragFrom.X, input.Position.Y - dragFrom.Y)
+			local x = math.clamp(dragStart.X.Offset + delta.X, 0, math.max(0, vp.X - CFG.W))
+			local y = math.clamp(dragStart.Y.Offset + delta.Y, 0, math.max(0, vp.Y - CFG.H))
+			panel.Position = UDim2.fromOffset(x, y)
+		end
+	end)
+	
+	UserInputService.InputEnded:Connect(function(input)
+		if input.UserInputType == Enum.UserInputType.MouseButton1 or input.UserInputType == Enum.UserInputType.Touch then
+			dragging = false
+		end
+	end)
+
+	cleanup(function()
+		if gui then
+			gui:Destroy()
+			gui = nil
+			panel = nil
+		end
+	end)
+end
+
+-- Функции кастомизации интерфейса (Темы и Прозрачность)
+cycleTheme = function()
+	local themeKeys = {"dark", "cyber", "minimal", "amethyst"}
+	local currentIndex = 1
+	for i, k in ipairs(themeKeys) do
+		if k == RUNTIME.THEME then
+			currentIndex = i
+			break
+		end
+	end
+	local nextIndex = (currentIndex % #themeKeys) + 1
+	RUNTIME.THEME = themeKeys[nextIndex]
+	CURRENT_THEME = THEMES[RUNTIME.THEME]
+	
+	if gui then
+		gui:Destroy()
+	end
+	buildGui()
+	refreshButtons()
+end
+
+cycleTransparency = function()
+	local transLevels = {0.04, 0.25, 0.50, 0.80}
+	local currentIndex = 1
+	for i, t in ipairs(transLevels) do
+		if math.abs(t - RUNTIME.TRANSPARENCY) < 0.05 then
+			currentIndex = i
+			break
+		end
+	end
+	local nextIndex = (currentIndex % #transLevels) + 1
+	RUNTIME.TRANSPARENCY = transLevels[nextIndex]
+	if panel then
+		panel.BackgroundTransparency = RUNTIME.TRANSPARENCY
+	end
+end
+
+refreshButtons = function()
+	if not btns.auto then
+		return
+	end
+	setBtn(btns.auto, RUNTIME.AUTO, RUNTIME.AUTO and "AUTOPLAY   ON" or "AUTOPLAY   OFF")
+	setBtn(btns.legit, RUNTIME.STYLE == "legit", "STYLE  LEGIT", CURRENT_THEME.on)
+	setBtn(btns.raj, RUNTIME.STYLE == "raj", "STYLE  RAJ", CURRENT_THEME.raj)
+	setBtn(btns.best, RUNTIME.MODE == "best", "PLAY  BEST")
+	setBtn(btns.elo, RUNTIME.MODE == "elo", "PLAY  ELO " .. RUNTIME.ELO)
+	setBtn(btns.engineLocal, RUNTIME.SOURCE == "local", "ENGINE  LOCAL")
+	setBtn(btns.engineVortex, RUNTIME.SOURCE == "vortex", "ENGINE  VORTEX")
+	if btns.theme then
+		btns.theme.Text = "THEME: " .. string.upper(RUNTIME.THEME)
+	end
+end
+
+local function layoutPanel()
+	if dragged or not panel or not panel.Parent then
+		return
+	end
+	local cam = workspace.CurrentCamera
+	local vp = cam and cam.ViewportSize or Vector2.new(1920, 1080)
+	if vp.X >= 800 then
+		panel.Position = UDim2.fromOffset(vp.X - CFG.W - CFG.MARGIN, CFG.TOP)
+	end
+end
+
+-- actions ---------------------------------------------------------------------------------
+
+toggleAuto = function()
+	RUNTIME.AUTO = not RUNTIME.AUTO
+	S.thinkAt = os.clock() + (RUNTIME.AUTO and humanDelay() or 0)
+	S.status = RUNTIME.AUTO and "autopilot on" or "autopilot off"
+	refreshButtons()
+end
+
+playNow = function()
+	local session = App.session
+	if not session then
+		S.status = "no game running"
+		return
+	end
+	if S.busy or not S.best then
+		S.status = "engine still thinking"
+		return
+	end
+	local uci = pickMove(session)
+	if type(uci) ~= "string" then
+		S.status = "no move available"
+		return
+	end
+	local ok, err = playUci(uci)
+	S.status = ok and ("played " .. tostring(err)) or tostring(err)
+end
+
+copyPosition = function()
+	local session = App.session
+	if not session then
+		S.status = "no game running"
+		return
+	end
+	local fen = session.engine:getFen()
+	local sans = table.concat(session.sans, " ")
+	pcall(setclipboard, fen .. "\n" .. sans)
+	S.status = "fen + moves copied"
+end
+
+startBotGame = function()
+	local ok, err = pcall(function()
+		App.startBotGame("jasper", "white")
+	end)
+	S.status = ok and "practice game started" or ("bot game failed: " .. tostring(err))
+end
+
+applyPreset = function(name)
+	local preset = PRESETS[name]
+	if not preset then
+		return
+	end
+	RUNTIME.STYLE = name
+	RUNTIME.SOURCE = preset.source
+	RUNTIME.MODE = preset.mode
+	RUNTIME.ELO = preset.elo
+	RUNTIME.NOISE = preset.noise
+	RUNTIME.BLUNDER = preset.blunder
+	RUNTIME.DELAY_MIN = preset.delayMin
+	RUNTIME.DELAY_MAX = preset.delayMax
+	S.ply = -1
+	S.status = name .. " preset"
+	if syncDelay then
+		syncDelay()
+	end
+	refreshButtons()
+end
+
+-- hotkeys ---------------------------------------------------------------------------------
+
+local function onKey(input, processed)
+	if processed or UserInputService:GetFocusedTextBox() then
+		return
+	end
+	local code = input.KeyCode
+	if code == Enum.KeyCode.End then
+		toggleAuto()
+	elseif code == Enum.KeyCode.Home then
+		RUNTIME.SHOW_ARROW = not RUNTIME.SHOW_ARROW
+		if not RUNTIME.SHOW_ARROW then
+			clearArrows()
+		end
+		refreshButtons()
+	elseif code == Enum.KeyCode.PageUp then
+		if gui then
+			gui.Enabled = not gui.Enabled
+		end
+	elseif code == Enum.KeyCode.PageDown then
+		RUNTIME.SOURCE = RUNTIME.SOURCE == "local" and "vortex" or "local"
+		RUNTIME.STYLE = "custom"
+		S.ply = -1
+		refreshButtons()
+	elseif code == Enum.KeyCode.Insert then
+		copyPosition()
+	end
+end
+
+local prevConn = GENV.__RoCheeseConn
+if prevConn then
+	pcall(function()
+		prevConn:Disconnect()
+	end)
+end
+local conn = UserInputService.InputBegan:Connect(onKey)
+GENV.__RoCheeseConn = conn
+cleanup(function()
+	conn:Disconnect()
+end)
+
+local GAME_KINDS = {
+	bot = true,
+	online = true,
+	puzzle = true,
+	rush = true,
+}
+
+local function pushEval()
+	local session = App.session
+	local kind = session and session.kind
+	if not session or not kind or not GAME_KINDS[kind] then
+		lastEval = nil
+		return
+	end
+	if S.busy or not S.best then
+		return
+	end
+	local score = S.score
+	if lastEval == score then
+		return
+	end
+	lastEval = score
+	local mate = nil
+	if math.abs(score) >= 29900 then
+		mate = math.max(1, math.floor((30000 - math.abs(score)) / 100 + 0.5))
+	end
+	pcall(function()
+		App.setEval(score, mate)
+	end)
+end
+
+local function formatClock(ms)
+	if type(ms) ~= "number" then
+		return "-"
+	end
+	ms = math.max(0, ms)
+	local total = math.floor(ms / 1000)
+	return string.format("%d:%02d", math.floor(total / 60), total % 60)
+end
+
+local function evalText(score)
+	local abs = math.abs(score)
+	if abs >= 29900 then
+		local moves = math.max(1, math.floor((30000 - abs) / 100 + 0.5))
+		return string.format("M%d %s", moves, score > 0 and "white" or "black")
+	end
+	local pawns = score / 100
+	return string.format("%s%.2f", pawns >= 0 and "+" or "", pawns)
+end
+
+local function refreshPanel(session, ply)
+	if not panel or not panel.Parent then
+		return
+	end
+
+	rows.title.Text = "ROCHESS ENGINE"
+	rows.status.Text = S.status
+	rows.eval.Text = session
+		and (S.busy and "EVAL ...      DEPTH ..." or string.format("EVAL %s      DEPTH %d", evalText(S.score), S.depth))
+		or "EVAL -      DEPTH 0"
+	if S.busy then
+		rows.best.Text = "1 thinking..."
+		rows.rest.Text = ""
+	else
+		rows.best.Text = S.best and string.format("1  %s   (%s)", S.san or "?", S.best) or "1  -"
+		local parts = {}
+		if S.second then
+			table.insert(parts, string.format("2  %s", S.secondSan or S.second))
+		end
+		if S.third then
+			table.insert(parts, string.format("3  %s", S.thirdSan or S.third))
+		end
+		rows.rest.Text = table.concat(parts, "     ")
+	end
+	local myClock, oppClock = "-", "-"
+	if session and session.clocks and session.myColor then
+		myClock = formatClock(session.clocks[session.myColor])
+		oppClock = formatClock(session.clocks[-session.myColor])
+	end
+	rows.game.Text = session
+		and string.format("%s | ply %d | clock %s/%s",
+			session.myColor == 1 and (session.white and session.white.display or "white")
+				or (session.black and session.black.display or "black"),
+			ply,
+			myClock,
+			oppClock)
+		or "no game"
+
+	if session and session.kind == "idle" then
+		rows.status.Text = "no game running - press BOT GAME or Play in the game"
+	end
+
+	if dot then
+		if S.busy then
+			dot.BackgroundColor3 = CURRENT_THEME.acc
+		elseif S.best then
+			dot.BackgroundColor3 = RUNTIME.ARROW_1
+		else
+			dot.BackgroundColor3 = Color3.fromRGB(200, 80, 70)
+		end
+	end
+
+	pushEval()
+end
+
+-- main loop -------------------------------------------------------------------------------
+
+buildGui()
+refreshButtons()
+S.status = "ready"
+
+GENV.__RoCheese.api = {
+	auto = toggleAuto,
+	play = playNow,
+	copy = copyPosition,
+	theme = cycleTheme,
+	transparency = cycleTransparency,
+	state = function()
+		return {
+			ply = S.ply,
+			best = S.best,
+			san = S.san,
+			second = S.second,
+			third = S.third,
+			score = S.score,
+			depth = S.depth,
+			status = S.status,
+			auto = RUNTIME.AUTO,
+			style = RUNTIME.STYLE,
+			source = RUNTIME.SOURCE,
+			mode = RUNTIME.MODE,
+			theme = RUNTIME.THEME,
+		}
+	end,
+}
+
+task.spawn(function()
+	while alive() do
+		local session = App.session
+		local ply = session and #session.ucis or -1
+		local sid = session and session.id or nil
+
+		if session and sid ~= S.sessionId then
+			S.sessionId = sid
+			lastEval = nil
+			pcall(function()
+				Bot.clearTT()
+			end)
+		end
+
+		if session and ply ~= S.ply then
+			S.ply = ply
+			S.thinkAt = os.clock() + humanDelay()
+			S.best = nil
+			S.san = nil
+			S.second = nil
+			S.third = nil
+			S.secondSan = nil
+			S.thirdSan = nil
+			clearArrows()
+			if not S.busy then
+				S.busy = true
+				local startFen = session.startFen
+				local moves = table.clone(session.ucis)
+				local wantPly = ply
+
+				task.spawn(function()
+					local res = analyseBest(startFen, moves)
+					if not alive() then
+						return
+					end
+					S.busy = false
+					local live = App.session
+					if not live or #live.ucis ~= wantPly then
+						S.ply = -1
+						return
+					end
+					if type(res) ~= "table" then
+						S.status = "engine failed"
+						return
+					end
+					S.best = res.best
+					S.score = tonumber(res.score) or 0
+					S.depth = tonumber(res.depth) or 0
+					S.status = "engine ready"
+					local engine = buildEngine(startFen, moves)
+					S.san = sanOf(engine, res.best)
+
+					task.spawn(function()
+						local ranked = rankContinuations(startFen, moves, res.best)
+						if not alive() then
+							return
+						end
+						local live2 = App.session
+						if not live2 or #live2.ucis ~= wantPly or not ranked then
+							return
+						end
+						S.second = ranked[1] and ranked[1].uci or nil
+						S.secondSan = ranked[1] and ranked[1].san or nil
+						S.third = ranked[2] and ranked[2].uci or nil
+						S.thirdSan = ranked[2] and ranked[2].san or nil
+					end)
+				end)
+			end
+		end
+
+		if session then
+			local live = RUNTIME.SHOW_ARROW and session.viewPly == ply and not session.over
+			if live then
+				if S.best then
+					drawArrow(ARROW_KEYS[1], S.best, RUNTIME.ARROW_1, true)
+				end
+				if S.second then
+					drawRow(ARROW_KEYS[2], S.second, RUNTIME.ARROW_2, false)
+					drawArrow(ARROW_KEYS[2], S.second, RUNTIME.ARROW_2, false)
+				end
+				if S.third then
+					drawArrow(ARROW_KEYS[3], S.third, RUNTIME.ARROW_3, false)
+				end
+			else
+				clearArrows()
+			end
+			autopilotTick(session, ply)
+		end
+
+		refreshPanel(session, ply)
+		layoutPanel()
+		task.wait(0.12)
+	end
+end)
+
+cleanup(clearArrows)
+
+print("[rocheese] ready - Mobile/PC responsive UI loaded with Custom Themes & Transparency!")
